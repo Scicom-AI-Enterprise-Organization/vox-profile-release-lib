@@ -1,6 +1,9 @@
-import os
+import pdb
 import torch
+import argparse
+import numpy as np
 import loralib as lora
+import transformers.models.wav2vec2.modeling_wav2vec2 as w2v2
 import transformers.models.wavlm.modeling_wavlm as wavlm
 from speechbrain.lobes.models.huggingface_transformers.huggingface import make_padding_masks
 
@@ -10,10 +13,7 @@ from huggingface_hub import PyTorchModelHubMixin
 from transformers import Wav2Vec2FeatureExtractor
 from transformers import WavLMModel
 
-import sys
-from pathlib import Path
-sys.path.append(os.path.join(str(Path(os.path.realpath(__file__)).parents[1])))
-from adapter import Adapter
+
 
 class WavLMEncoderLayer(nn.Module):
     def __init__(self, layer_idx, config, has_relative_position_bias: bool = True):
@@ -36,19 +36,8 @@ class WavLMEncoderLayer(nn.Module):
             if self.config.finetune_method == "lora" or self.config.finetune_method == "combined":
                 self.feed_forward.intermediate_dense    = lora.Linear(config.hidden_size, config.intermediate_size, r=config.lora_rank)
                 self.feed_forward.output_dense          = lora.Linear(config.intermediate_size, config.hidden_size, r=config.lora_rank)
-            
-        if self.config.finetune_method == "adapter" or self.config.finetune_method == "combined":
-            self.adapter = Adapter(
-                config, 
-                dropout=0.1, 
-                bottleneck=config.adapter_hidden_dim, 
-                adapter_scalar=0.1
-            )
-
-    def forward(self, hidden_states, attention_mask=None, position_bias=None, output_attentions=False, index=0):
-        if self.config.finetune_method == "embedding_prompt" or self.config.finetune_method == "combined":
-            hidden_states = torch.cat((self.embed_prompt.repeat(hidden_states.size(0), 1, 1), hidden_states), dim=1)
         
+    def forward(self, hidden_states, attention_mask=None, position_bias=None, output_attentions=False, index=0):
         attn_residual = hidden_states
         hidden_states, attn_weights, position_bias = self.attention(
             hidden_states,
@@ -66,13 +55,7 @@ class WavLMEncoderLayer(nn.Module):
 
         hidden_states = self.layer_norm(hidden_states)
         hidden_states = hidden_states + self.feed_forward(hidden_states)
-        if self.config.finetune_method == "adapter": 
-            hidden_states = hidden_states + adapt_h
-        if self.config.finetune_method == "combined": 
-            hidden_states = hidden_states + self.adapter(hidden_states)
         hidden_states = self.final_layer_norm(hidden_states)
-        if self.config.finetune_method == "embedding_prompt" or self.config.finetune_method == "combined":
-            hidden_states = hidden_states[:, self.config.embedding_prompt_dim:, :]
         outputs = (hidden_states, position_bias)
 
         if output_attentions:
@@ -103,6 +86,7 @@ class WavLMEncoderLayerStableLayerNorm(nn.Module):
                 self.feed_forward.intermediate_dense    = lora.Linear(config.hidden_size, config.intermediate_size, r=config.lora_rank)
                 self.feed_forward.output_dense          = lora.Linear(config.intermediate_size, config.hidden_size, r=config.lora_rank)
             
+
     def forward(self, hidden_states, attention_mask=None, position_bias=None, output_attentions=False):
         attn_residual = hidden_states
         hidden_states = self.layer_norm(hidden_states)
@@ -136,17 +120,19 @@ class WavLMWrapper(
         finetune_method="lora",
         lora_rank=16,
         freeze_params=True,
+        output_class_num=4,
         use_conv_output=True,
-        percept="complete"
+        detailed_class_num=17,
+        predict_gender=False
     ):
         super(WavLMWrapper, self).__init__()
         # 1. We Load the model first with weights
-        self.freeze_params      = freeze_params
-        self.finetune_method    = finetune_method
-        self.use_conv_output    = use_conv_output
         self.pretrain_model     = pretrain_model
-        self.percept            = percept
-
+        self.finetune_method    = finetune_method
+        self.freeze_params      = freeze_params
+        self.use_conv_output    = use_conv_output
+        self.lora_rank          = lora_rank
+        self.predict_gender     = predict_gender
         if self.pretrain_model == "wavlm":
             self.backbone_model = WavLMModel.from_pretrained(
                 "microsoft/wavlm-base-plus",
@@ -161,13 +147,13 @@ class WavLMWrapper(
         state_dict = self.backbone_model.state_dict()
         # 2. Read the model config
         self.model_config = self.backbone_model.config
-        self.model_config.finetune_method        = finetune_method
-        self.model_config.lora_rank              = lora_rank
+        self.model_config.finetune_method        = self.finetune_method
+        self.model_config.lora_rank              = self.lora_rank
         
         # 3. Config encoder layers with adapter or embedding prompt
         if self.pretrain_model == "wavlm":
             self.backbone_model.encoder.layers = nn.ModuleList(
-                [WavLMEncoderLayer(self.model_config, has_relative_position_bias=(i == 0)) for i in range(self.model_config.num_hidden_layers)]
+                [WavLMEncoderLayer(i, self.model_config, has_relative_position_bias=(i == 0)) for i in range(self.model_config.num_hidden_layers)]
             )
         elif self.pretrain_model == "wavlm_large":
             self.backbone_model.encoder.layers = nn.ModuleList(
@@ -177,6 +163,7 @@ class WavLMWrapper(
         msg = self.backbone_model.load_state_dict(state_dict, strict=False)
 
         # 5. Freeze the weights
+        self.freeze_params = freeze_params
         if self.freeze_params and self.finetune_method != "lora":
             for _, p in self.backbone_model.named_parameters(): p.requires_grad = False
         elif self.freeze_params and self.finetune_method == "lora":
@@ -204,47 +191,32 @@ class WavLMWrapper(
             num_layers = self.model_config.num_hidden_layers
             self.weights = nn.Parameter(torch.zeros(num_layers))
         
-        if self.percept == "pitch":
-            self.output_layer = nn.Sequential(
+        self.arousal_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+        self.valence_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+        self.dominance_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        
+        if self.predict_gender:
+            self.gender_layer = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, 3),
-            )
-        elif self.percept == "texture":
-            self.output_layer = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 5),
-            )
-        elif self.percept == "volume":
-            self.output_layer = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 5),
-            )
-        elif self.percept == "clarity":
-            self.output_layer = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 4),
-            )
-        elif self.percept == "rhythm":
-            self.output_layer = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 8),
-            )
-        elif self.percept == "expressiveness":
-            self.output_layer = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 5),
-            )
-        else:
-            self.output_layer = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 25),
+                nn.Linear(hidden_dim, 2)
             )
         
     def forward(self, x, length=None, return_feature=False):
@@ -252,7 +224,6 @@ class WavLMWrapper(
         if self.pretrain_model == "wavlm_large":  
             with torch.no_grad():
                 signal, attention_mask = list(), list()
-                # pdb.set_trace()
                 if length is not None: attention_mask = make_padding_masks(x, wav_len=length/length.max()).to(x.device)
                 else: attention_mask = make_padding_masks(x, wav_len=torch.tensor([1]).to(x.device)).to(x.device)
 
@@ -260,7 +231,7 @@ class WavLMWrapper(
                     input = self.processor(x[idx], sampling_rate=16_000, return_tensors="pt", padding=True)
                     signal.append(input["input_values"][0].to(x.device))
                 signal = torch.stack(signal)
-        
+
         # 2. get length and mask
         if length is not None:
             length = self.get_feat_extract_output_lengths(length.detach().cpu())
@@ -268,8 +239,7 @@ class WavLMWrapper(
 
         if self.pretrain_model == "wavlm": 
             x = self.backbone_model(
-                x, 
-                output_hidden_states=True
+                x, output_hidden_states=True
             ).hidden_states
         else: 
             x = self.backbone_model(
@@ -314,9 +284,15 @@ class WavLMWrapper(
 
         # 8. Output predictions
         # B x D
-        predicted = self.output_layer(features)
-        if return_feature: return predicted, features
-        return predicted
+        arousal             = self.arousal_layer(features)
+        valence             = self.valence_layer(features)
+        dominance           = self.dominance_layer(features)
+        
+        if(self.predict_gender):
+            gender_outputs = self.gender_layer(features)
+            return arousal, valence, dominance, gender_outputs
+        
+        return arousal, valence, dominance
     
     # From huggingface
     def get_feat_extract_output_lengths(self, input_length):

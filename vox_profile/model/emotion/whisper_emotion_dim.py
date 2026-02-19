@@ -1,4 +1,3 @@
-import os
 import copy
 import torch
 import loralib as lora
@@ -8,10 +7,6 @@ from torch import nn
 from transformers.activations import ACT2FN
 from huggingface_hub import PyTorchModelHubMixin
 from transformers import WhisperModel, AutoFeatureExtractor
-
-import sys
-from pathlib import Path
-sys.path.append(os.path.join(str(Path(os.path.realpath(__file__)).parents[1])))
 
 class WhisperEncoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
@@ -100,7 +95,8 @@ class WhisperWrapper(
         freeze_params=True,
         output_class_num=4,
         use_conv_output=True,
-        detailed_class_num=17
+        detailed_class_num=17,
+        predict_gender=False,
     ):
         super(WhisperWrapper, self).__init__()
         # 1. We Load the model first with weights
@@ -109,6 +105,7 @@ class WhisperWrapper(
         self.freeze_params      = freeze_params
         self.use_conv_output    = use_conv_output
         self.lora_rank          = lora_rank
+        self.predict_gender     = predict_gender
         self.feature_extractor = AutoFeatureExtractor.from_pretrained("openai/whisper-tiny", chunk_length=15)
         if self.pretrain_model == "whisper_tiny":
             self.backbone_model = WhisperModel.from_pretrained(
@@ -226,6 +223,12 @@ class WhisperWrapper(
             nn.Sigmoid()
         )
         
+        if(self.predict_gender):
+            self.gender_layer = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 2)
+            )
         
     def forward(self, x, length=None, return_feature=False):
                 
@@ -293,13 +296,16 @@ class WhisperWrapper(
         
         # Output predictions
         # B x D
-        predicted = self.emotion_layer(features)
-        detailed_predicted = self.detailed_out_layer(features)
         arousal = self.arousal_layer(features)
         valence = self.valence_layer(features)
         dominance = self.dominance_layer(features)
-        if return_feature: return predicted, features, detailed_predicted, arousal, valence, dominance
-        return predicted, detailed_predicted, arousal, valence, dominance
+        
+        if(self.predict_gender):
+            gender_outputs = self.gender_layer(features)
+            return arousal, valence, dominance, gender_outputs
+        if return_feature:
+            features, arousal, valence, dominance
+        return arousal, valence, dominance
         
     # From huggingface
     def _get_feat_extract_output_lengths(self, input_lengths):

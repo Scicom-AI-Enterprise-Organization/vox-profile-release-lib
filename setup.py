@@ -6,7 +6,7 @@ with open("requirements.txt") as f:
 setup(
     name="vox-profile",
     version="0.1.0",
-    packages=find_packages(),  # auto-detects packages in the folder
+    packages=find_packages(exclude=["example", "example.*"]),
     install_requires=required,
     author="Tiantian Feng",
     author_email="tiantiaf@usc.edu",

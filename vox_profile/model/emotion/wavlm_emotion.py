@@ -1,10 +1,5 @@
-import os
-import pdb
 import torch
-import argparse
-import numpy as np
 import loralib as lora
-import transformers.models.wav2vec2.modeling_wav2vec2 as w2v2
 import transformers.models.wavlm.modeling_wavlm as wavlm
 from speechbrain.lobes.models.huggingface_transformers.huggingface import make_padding_masks
 
@@ -13,10 +8,6 @@ from torch.nn import functional as F
 from huggingface_hub import PyTorchModelHubMixin
 from transformers import Wav2Vec2FeatureExtractor
 from transformers import WavLMModel
-
-import sys
-from pathlib import Path
-sys.path.append(os.path.join(str(Path(os.path.realpath(__file__)).parents[1])))
 
 class WavLMEncoderLayer(nn.Module):
     def __init__(self, layer_idx, config, has_relative_position_bias: bool = True):
@@ -125,8 +116,7 @@ class WavLMWrapper(
         freeze_params=True,
         output_class_num=4,
         use_conv_output=True,
-        detailed_class_num=17,
-        predict_gender=False
+        detailed_class_num=17
     ):
         super(WavLMWrapper, self).__init__()
         # 1. We Load the model first with weights
@@ -135,7 +125,6 @@ class WavLMWrapper(
         self.freeze_params      = freeze_params
         self.use_conv_output    = use_conv_output
         self.lora_rank          = lora_rank
-        self.predict_gender     = predict_gender
         if self.pretrain_model == "wavlm":
             self.backbone_model = WavLMModel.from_pretrained(
                 "microsoft/wavlm-base-plus",
@@ -194,6 +183,18 @@ class WavLMWrapper(
             num_layers = self.model_config.num_hidden_layers
             self.weights = nn.Parameter(torch.zeros(num_layers))
         
+        self.emotion_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_class_num),
+        )
+
+        self.detailed_out_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, detailed_class_num),
+        )
+        
         self.arousal_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -214,13 +215,6 @@ class WavLMWrapper(
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
-        
-        if self.predict_gender:
-            self.gender_layer = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 2)
-            )
         
     def forward(self, x, length=None, return_feature=False):
         # 1. feature extraction and projections
@@ -285,17 +279,15 @@ class WavLMWrapper(
         else:
             features = torch.mean(features, dim=1)
 
-        # 8. Output predictions
+        # Output predictions
         # B x D
+        predicted           = self.emotion_layer(features)
+        detailed_predicted  = self.detailed_out_layer(features)
         arousal             = self.arousal_layer(features)
         valence             = self.valence_layer(features)
         dominance           = self.dominance_layer(features)
-        
-        if(self.predict_gender):
-            gender_outputs = self.gender_layer(features)
-            return arousal, valence, dominance, gender_outputs
-        
-        return arousal, valence, dominance
+        if return_feature: return predicted, features, detailed_predicted, arousal, valence, dominance
+        return predicted, detailed_predicted, arousal, valence, dominance
     
     # From huggingface
     def get_feat_extract_output_lengths(self, input_length):

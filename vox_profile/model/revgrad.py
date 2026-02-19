@@ -1,4 +1,4 @@
-from revgrad_func import revgrad
+from .revgrad_func import revgrad
 from torch.nn import Module
 from torch import tensor
 

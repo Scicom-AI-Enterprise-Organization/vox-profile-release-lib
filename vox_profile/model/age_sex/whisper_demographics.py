@@ -1,4 +1,4 @@
-import os
+import pdb
 import copy
 import torch
 import loralib as lora
@@ -9,9 +9,7 @@ from transformers.activations import ACT2FN
 from huggingface_hub import PyTorchModelHubMixin
 from transformers import WhisperModel, AutoFeatureExtractor
 
-import sys
-from pathlib import Path
-sys.path.append(os.path.join(str(Path(os.path.realpath(__file__)).parents[1])))
+from ..revgrad import RevGrad
 
 class WhisperEncoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
@@ -84,7 +82,6 @@ class WhisperEncoderLayer(nn.Module):
             outputs += (attn_weights,)
 
         return outputs
-
    
 class WhisperWrapper(
     nn.Module,
@@ -93,24 +90,23 @@ class WhisperWrapper(
 ):
     def __init__(
         self, 
-        pretrain_model="wavlm_large", 
-        hidden_dim=256,
+        pretrain_model="whisper_large",
+        output_class_num=4, 
+        hidden_dim=256, 
         finetune_method="lora",
         lora_rank=16,
         freeze_params=True,
-        output_class_num=4,
         use_conv_output=True,
-        detailed_class_num=17,
-        predict_gender=False,
+        apply_gradient_reversal=False, 
+        num_dataset=4,
+        apply_reg=False
     ):
         super(WhisperWrapper, self).__init__()
         # 1. We Load the model first with weights
-        self.pretrain_model     = pretrain_model
-        self.finetune_method    = finetune_method
-        self.freeze_params      = freeze_params
-        self.use_conv_output    = use_conv_output
-        self.lora_rank          = lora_rank
-        self.predict_gender     = predict_gender
+        self.pretrain_model             = pretrain_model
+        self.finetune_method            = finetune_method
+        self.apply_gradient_reversal    = apply_gradient_reversal
+        self.use_conv_output            = use_conv_output
         self.feature_extractor = AutoFeatureExtractor.from_pretrained("openai/whisper-tiny", chunk_length=15)
         if self.pretrain_model == "whisper_tiny":
             self.backbone_model = WhisperModel.from_pretrained(
@@ -154,11 +150,10 @@ class WhisperWrapper(
         # 2. Read the model config
         self.model_config = self.backbone_model.config
         self.model_config.finetune_method        = self.finetune_method
-        self.model_config.lora_rank              = self.lora_rank
+        self.model_config.lora_rank              = lora_rank
 
         if self.finetune_method == "lora":
             # 3. Config encoder layers with adapter or embedding prompt
-            # pdb.set_trace()
             self.backbone_model.encoder.layers = nn.ModuleList(
                 [WhisperEncoderLayer(self.model_config, layer_idx) for layer_idx in range(self.model_config.encoder_layers)]
             )
@@ -166,6 +161,7 @@ class WhisperWrapper(
             msg = self.backbone_model.load_state_dict(state_dict, strict=False)
         
         # 2. Freeze the weights
+        self.freeze_params = freeze_params
         if self.freeze_params and self.finetune_method != "lora":
             for _, p in self.backbone_model.named_parameters(): p.requires_grad = False
         elif self.freeze_params and self.finetune_method == "lora":
@@ -195,48 +191,36 @@ class WhisperWrapper(
             num_layers = self.model_config.num_hidden_layers
             self.weights = nn.Parameter(torch.zeros(num_layers))
         
-        self.emotion_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_class_num),
-        )
-
-        self.detailed_out_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, detailed_class_num),
-        )
-        
-        self.arousal_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-
-        self.valence_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-
-        self.dominance_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-        
-        if(self.predict_gender):
-            self.gender_layer = nn.Sequential(
+        self.apply_reg = apply_reg
+        if apply_reg:
+            self.age_dist_layer = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, 2)
+                nn.Linear(hidden_dim, 1),
+                nn.Sigmoid()
+            )
+        else:
+            self.age_dist_layer = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 7),
             )
         
-    def forward(self, x, length=None, return_feature=False):
-                
+        self.sex_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+        if apply_gradient_reversal:
+            self.dataset_layer = nn.Sequential(
+                RevGrad(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, num_dataset),
+            )
+        
+    def forward(self, x, length=None, return_feature=False, pred="age_dist_sex"):
         # 1. feature extraction and projections
         if length is not None:
             max_audio_len = 15*16000
@@ -263,6 +247,7 @@ class WhisperWrapper(
             )
             features = features.input_features.cuda()
         
+        # pdb.set_trace()
         # 2. get length and mask
         if length is not None:
             length = self._get_feat_extract_output_lengths(length.detach().cpu())
@@ -298,19 +283,17 @@ class WhisperWrapper(
             features = torch.stack(mean)
         else:
             features = torch.mean(features, dim=1)
-        
-        # Output predictions
+            
+        # 8. Output predictions
         # B x D
-        arousal = self.arousal_layer(features)
-        valence = self.valence_layer(features)
-        dominance = self.dominance_layer(features)
-        
-        if(self.predict_gender):
-            gender_outputs = self.gender_layer(features)
-            return arousal, valence, dominance, gender_outputs
-        if return_feature:
-            features, arousal, valence, dominance
-        return arousal, valence, dominance
+        if self.apply_gradient_reversal: dataset_predicted = self.dataset_layer(features)
+        if pred == "age_dist_sex": 
+            age_predicted = self.age_dist_layer(features)
+            sex_predicted = self.sex_layer(features)
+            if return_feature and self.apply_gradient_reversal: return age_predicted, sex_predicted, dataset_predicted, features
+            if return_feature: return age_predicted, sex_predicted, features
+            if self.apply_gradient_reversal: return age_predicted, sex_predicted, dataset_predicted
+            return age_predicted, sex_predicted
         
     # From huggingface
     def _get_feat_extract_output_lengths(self, input_lengths):
@@ -320,3 +303,4 @@ class WhisperWrapper(
         input_lengths = input_lengths // 160
         input_lengths = (input_lengths - 1) // 2 + 1
         return input_lengths
+

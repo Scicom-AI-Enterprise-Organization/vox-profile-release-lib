@@ -1,4 +1,3 @@
-import os
 import copy
 import torch
 import loralib as lora
@@ -9,10 +8,7 @@ from transformers.activations import ACT2FN
 from huggingface_hub import PyTorchModelHubMixin
 from transformers import WhisperModel, AutoFeatureExtractor
 
-import sys
-from pathlib import Path
-sys.path.append(os.path.join(str(Path(os.path.realpath(__file__)).parents[1])))
-from revgrad import RevGrad
+from ..revgrad import RevGrad
 
 class WhisperEncoderLayer(nn.Module):
     def __init__(self, config, layer_idx):

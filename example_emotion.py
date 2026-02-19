@@ -1,7 +1,7 @@
 import torch
 import torchaudio
 import torch.nn.functional as F
-from src.model.emotion.whisper_emotion import WhisperWrapper
+from vox_profile.model.emotion.whisper_emotion import WhisperWrapper
 
 emotion_list = [
     'Anger', 
@@ -26,7 +26,7 @@ model.eval()
 # Our training data filters output audio shorter than 3 seconds (unreliable predictions) and longer than 15 seconds (computation limitation)
 # So you need to prepare your audio to a maximum of 15 seconds, 16kHz and mono channel
 max_audio_length = 15 * 16000
-data, _ = torchaudio.load("YOUR_DATA")
+data, _ = torchaudio.load("husein-english.mp3")
 data = data.float().to(device)[:, :max_audio_length]
 logits, embedding, _, _, _, _ = model(data, return_feature=True)
     
