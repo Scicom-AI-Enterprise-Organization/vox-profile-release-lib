@@ -26,8 +26,8 @@ model.eval()
 # Our training data filters output audio shorter than 3 seconds (unreliable predictions) and longer than 15 seconds (computation limitation)
 # So you need to prepare your audio to a maximum of 15 seconds, 16kHz and mono channel
 max_audio_length = 15 * 16000
-data, _ = torchaudio.load("husein-english.mp3")
-data = data.float().to(device)[:, :max_audio_length]
+y, _ = librosa.load("husein-english.mp3", sr = 16000)
+data = torch.from_numpy(y)[None]
 logits, embedding, _, _, _, _ = model(data, return_feature=True)
     
 # Probability
